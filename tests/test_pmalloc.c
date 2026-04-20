@@ -2,22 +2,71 @@
 
 #include <stdio.h>
 
-// test base dell'allocatore
+// test base dello stato interno dell'allocatore
 int main(void) {
+    int result;
 
-    // Inizializzazione con dimensione di test
-    int result = pseudo_malloc_init(1024);
-    
-    // verifica esito init
-    if (result != 0) {
-        printf("Initialization failed\n");
+    //all'inizio l'allocatore non deve essere inizializzato
+    if (pseudo_malloc_is_initialized() != 0){
+        printf("Test failed: allocator should start uninitialized\n");
         return 1;
     }
 
-    printf("Initialization succeeded\n");
-    
-    // chiusura allocatore
+    if (pseudo_malloc_arena_size() != 0){
+        printf("Test failed: initial arena size should be 0\n");
+        return 1;
+    }
+
+    //Init con parametro non valido 
+    result = pseudo_malloc_init(0);
+    if(result == 0){
+        printf("Test failed: init with size 0 should fail\n");
+        return 1;
+    }
+
+
+    // Init valida
+    result = pseudo_malloc_init(1024);
+    if (result != 0) {
+        printf("Test failed: valid init should succeed\n");
+        return 1;
+    }
+
+    if (pseudo_malloc_is_initialized() != 1){
+        printf("Test failed: allocator should be initialized\n");
+        return 1;
+    }
+
+    if (pseudo_malloc_arena_size() != 1024){
+        printf("Test failed: arena size should be 1024/n");
+        return 1;
+    }
+
+    //Doppia init: deve fallire
+    result = pseudo_malloc_init(2048);
+    if (result == 0) {
+        printf("Test failed: double init should fail\n");
+        return 1;
+    }
+
+    //Destroy valido
     pseudo_malloc_destroy();
 
+    if (pseudo_malloc_is_initialized() != 0){
+        printf("Test failed: allocator should be uninitialized after destroy\n");
+        return 1;
+    }
+
+    if (pseudo_malloc_arena_size() != 0) {
+        printf("Test failed: arena size should reset to 0 after destroy\n");
+        return 1;
+    }
+
+    //secondo destroy: non deve rompere il programma
+    pseudo_malloc_destroy();
+
+    printf("All tests passed\n");
     return 0;
+
+   
 }
