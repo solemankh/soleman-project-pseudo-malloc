@@ -14,6 +14,8 @@ int pseudo_malloc_is_initialized(void);
 
 // ritorna la dimansione corrente dell'arena, 0 se non inizializzato
 size_t pseudo_malloc_arena_size(void);
+ //Ritorna 1 se l'arena e' stata allocata, 0 altrimenti
+int pseudo_malloc_has_memory(void);
 
 
 #endif
