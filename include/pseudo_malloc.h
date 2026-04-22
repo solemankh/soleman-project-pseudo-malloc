@@ -3,19 +3,23 @@
 
 #include <stddef.h> //size_t per dimensioni in byte
  
- // inizializza l'allocatore con una certa dimensione di arena 
-int pseudo_malloc_init(size_t size);
+ // Inizializza il buddy allocator 
+int pseudo_malloc_init(size_t arena_size, int num_levels);
 
-// distrugge l'allocatore e libera la risorse
+// Rilascio le risore dell'allocatore
 void pseudo_malloc_destroy(void);
 
-// ritorna 1 se l'allocatore e' inizializzato, 0 altrimenti
-int pseudo_malloc_is_initialized(void);
+// Alloca memoria dall'arena gestita 
+void* pseudo_malloc(size_t size);
 
-// ritorna la dimansione corrente dell'arena, 0 se non inizializzato
+// Libera memoria precedemtemente allocata
+void pseudo_free(void* ptr);
+
+// Funzioni di supporto per i test
+int pseudo_malloc_is_initialized(void);
 size_t pseudo_malloc_arena_size(void);
- //Ritorna 1 se l'arena e' stata allocata, 0 altrimenti
-int pseudo_malloc_has_memory(void);
+int pseudo_malloc_num_levels(void);
+
 
 
 #endif

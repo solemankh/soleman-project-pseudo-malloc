@@ -2,100 +2,138 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// Struttura che rappresenta un blocco di memoria
-typedef struct block_header {
-    size_t size;          // dimensione del blocco
-    int is_free;          // 1 = libero, 0 = occupato
-    struct block_header* next; // puntatore al prossimo blocco
-} block_header;
+#define MAX_LEVELS 16
 
-// Stato interno dell'allocatore
-static int g_initialized = 0;
-static size_t g_arena_size = 0;
-// Puntatore base dell'arena
-static void* g_memory = NULL; 
+// Metadato di un blocco buddy
+typedef struct BuddyBlock {
+    int level;                  // livello del blocco
+    int is_free;                // 1 se libero, 0 se occupato
+    char* start;                // inizio del blocco nell'arena
+    size_t size;                // dimensione del blocco
+    struct BuddyBlock* next;    // prossimo blocco nella free list
+    struct BuddyBlock* buddy;   // buddy logico
+    struct BuddyBlock* parent;  // blocco padre
+} BuddyBlock;
 
-//Primo blocco dell'arena
-static block_header* g_first_block = NULL;
+// Stato globale del buddy allocator
+typedef struct BuddyAllocator {
+    int initialized;                    // stato init
+    int num_levels;                     // numero di livelli
+    size_t arena_size;                  // dimensione totale arena
+    size_t min_bucket_size;             // blocco minimo
+    char* memory;                       // arena gestita
+    BuddyBlock* free_lists[MAX_LEVELS]; // una free list per livello
+    BuddyBlock* root;                   // blocco iniziale
+} BuddyAllocator;
 
-// Inizializza l'allocatore e crea una prima arena lineare 
-int pseudo_malloc_init(size_t size) {
-    block_header* first_block;
+static BuddyAllocator g_allocator = {0};
 
-    // La dimensione dell'arena deve essere valida 
-    if (size == 0) {
-        printf("Error: size must be > 0\n");
+// Calcola la dimensione minima dei blocchi
+static size_t compute_min_bucket_size(size_t arena_size, int num_levels) {
+    return arena_size >> num_levels;
+}
+
+// Inizializza la struttura del buddy allocator
+int pseudo_malloc_init(size_t arena_size, int num_levels) {
+    int i;
+    BuddyBlock* root;
+
+    if (arena_size == 0) {
+        printf("Error: arena_size must be > 0\n");
         return -1;
     }
 
-    // evita doppia inizializzazione 
-    if (g_initialized) {
+    if (num_levels <= 0 || num_levels >= MAX_LEVELS) {
+        printf("Error: invalid number of levels\n");
+        return -1;
+    }
+
+    if (g_allocator.initialized) {
         printf("Error: allocator already initialized\n");
         return -1;
     }
 
-    // L'arena deve contenere almeno l'header di un blocco
-    if (size <= sizeof(block_header)) {
-        printf("Error: size too small for allocator metadata\n");
+    g_allocator.memory = (char*) malloc(arena_size);
+    if (g_allocator.memory == NULL) {
+        printf("Error: arena allocation failed\n");
         return -1;
     }
 
-    // Backend temporaneo: arena ottenuta con malloc
-    g_memory = malloc(size);
-    if (g_memory == NULL) {
-        printf("Error: arena allocatoin failed\n");
+    root = (BuddyBlock*) malloc(sizeof(BuddyBlock));
+    if (root == NULL) {
+        free(g_allocator.memory);
+        g_allocator.memory = NULL;
+        printf("Error: root metadata allocation failed\n");
         return -1;
     }
 
-    g_initialized = 1;
-    g_arena_size = size;
-    
-    // il primo blocco coincide con ;'inizio dell'arena 
-    first_block = (block_header*) g_memory;
-    first_block->size = size - sizeof(block_header);
-    first_block->is_free = 1;
-    first_block->next = NULL;
+    g_allocator.initialized = 1;
+    g_allocator.num_levels = num_levels;
+    g_allocator.arena_size = arena_size;
+    g_allocator.min_bucket_size = compute_min_bucket_size(arena_size, num_levels);
 
-    g_first_block = first_block;
+    for (i = 0; i < MAX_LEVELS; i++) {
+        g_allocator.free_lists[i] = NULL;
+    }
 
+    // Il blocco root rappresenta tutta l'arena
+    root->level = 0;
+    root->is_free = 1;
+    root->start = g_allocator.memory;
+    root->size = arena_size;
+    root->next = NULL;
+    root->buddy = NULL;
+    root->parent = NULL;
 
-    // Debug temporaneo: conferma init corretta
-    printf("pseudo_malloc_init: arena size = %lu\n", (unsigned long ) g_arena_size);
-    printf("pseudo_malloc_init: first block size = %lu\n", (unsigned long ) g_first_block->size);
+    g_allocator.root = root;
+    g_allocator.free_lists[0] = root;
+
+    printf("pseudo_malloc_init: arena size = %lu\n", (unsigned long) g_allocator.arena_size);
+    printf("pseudo_malloc_init: num levels = %d\n", g_allocator.num_levels);
+    printf("pseudo_malloc_init: min bucket size = %lu\n", (unsigned long) g_allocator.min_bucket_size);
+
     return 0;
 }
 
-// distrugge l'allocatore e libera l'arena
+// Per ora allocazione non ancora implementata
+void* pseudo_malloc(size_t size) {
+    (void) size;
+    return NULL;
+}
+
+// Per ora free non ancora implementato
+void pseudo_free(void* ptr) {
+    (void) ptr;
+}
+
+// Rilascia le risorse dell'allocatore
 void pseudo_malloc_destroy(void) {
-    // se non era inizializzato, non c'è nulla da distruggere
-    if(!g_initialized){
-        printf("Warning: destroy called before init\n"); 
+    if (!g_allocator.initialized) {
+        printf("Warning: destroy called before init\n");
         return;
     }
 
-    free(g_memory);
+    free(g_allocator.root);
+    free(g_allocator.memory);
 
-    g_memory = NULL;
-    g_first_block = NULL;
-    g_initialized = 0;
-    g_arena_size = 0;
-
+    g_allocator.root = NULL;
+    g_allocator.memory = NULL;
+    g_allocator.initialized = 0;
+    g_allocator.num_levels = 0;
+    g_allocator.arena_size = 0;
+    g_allocator.min_bucket_size = 0;
 
     printf("pseudo_malloc_destroy called\n");
 }
 
-//espone lo stato di inizializzazione per i test
-int pseudo_malloc_is_initialized(void){
-    return g_initialized;
+int pseudo_malloc_is_initialized(void) {
+    return g_allocator.initialized;
 }
 
-//espone la dimensione dell'arena per i test
-size_t pseudo_malloc_arena_size(void){
-    return g_arena_size;
+size_t pseudo_malloc_arena_size(void) {
+    return g_allocator.arena_size;
 }
 
-// verifica se l'arena e' stata allocata
-int pseudo_malloc_has_memory(void) {
-    return (g_memory != NULL);
+int pseudo_malloc_num_levels(void) {
+    return g_allocator.num_levels;
 }
-
