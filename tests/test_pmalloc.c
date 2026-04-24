@@ -1,7 +1,7 @@
 #include "pseudo_malloc.h"
 #include <stdio.h>
 
-// Test base della nuova allocazione buddy con backend mmap
+// Test completo base del buddy allocator con mmap e dump
 int main(void) {
     int result;
     void* p1;
@@ -23,28 +23,28 @@ int main(void) {
         return 1;
     }
 
-    // arena non valida
+    // Arena non valida
     result = pseudo_malloc_init(0, 4);
     if (result == 0) {
         printf("Test failed: init with arena_size 0 should fail\n");
         return 1;
     }
 
-    // livelli non validi
+    // Livelli non validi
     result = pseudo_malloc_init(4096, 0);
     if (result == 0) {
         printf("Test failed: init with invalid levels should fail\n");
         return 1;
     }
 
-    // arena non multipla della page size
+    // Arena non multipla della page size
     result = pseudo_malloc_init(5000, 4);
     if (result == 0) {
         printf("Test failed: init with non page-aligned arena should fail\n");
         return 1;
     }
 
-    // init valida
+    // Init valida
     result = pseudo_malloc_init(4096, 4);
     if (result != 0) {
         printf("Test failed: valid init should succeed\n");
@@ -66,14 +66,20 @@ int main(void) {
         return 1;
     }
 
-    // prima allocazione
+    printf("\n--- Initial state ---\n");
+    pseudo_malloc_dump();
+
+    // Prima allocazione
     p1 = pseudo_malloc(100);
     if (p1 == NULL) {
         printf("Test failed: first allocation should succeed\n");
         return 1;
     }
 
-    // seconda allocazione
+    printf("\n--- After first allocation ---\n");
+    pseudo_malloc_dump();
+
+    // Seconda allocazione
     p2 = pseudo_malloc(100);
     if (p2 == NULL) {
         printf("Test failed: second allocation should succeed\n");
@@ -85,26 +91,39 @@ int main(void) {
         return 1;
     }
 
-    // libero il primo e rialloco
+    printf("\n--- After second allocation ---\n");
+    pseudo_malloc_dump();
+
+    // Libero il primo blocco
     pseudo_free(p1);
 
+    printf("\n--- After freeing first allocation ---\n");
+    pseudo_malloc_dump();
+
+    // Riallocazione dopo free
     p3 = pseudo_malloc(100);
     if (p3 == NULL) {
         printf("Test failed: allocation after free should succeed\n");
         return 1;
     }
 
-    // richiesta troppo grande
+    printf("\n--- After allocation following free ---\n");
+    pseudo_malloc_dump();
+
+    // Richiesta troppo grande
     if (pseudo_malloc(50000) != NULL) {
         printf("Test failed: oversized allocation should fail\n");
         return 1;
     }
 
-    // libero tutto
+    // Libero tutto
     pseudo_free(p2);
     pseudo_free(p3);
 
-    // doppia init non valida
+    printf("\n--- After freeing all allocations ---\n");
+    pseudo_malloc_dump();
+
+    // Doppia init non valida
     result = pseudo_malloc_init(4096, 5);
     if (result == 0) {
         printf("Test failed: double init should fail\n");

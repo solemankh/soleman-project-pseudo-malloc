@@ -15,6 +15,9 @@ void* pseudo_malloc(size_t size);
 // Libera memoria precedentemente allocata
 void pseudo_free(void* ptr);
 
+// Stampa lo stato interno dell'allocatore (debug)
+void pseudo_malloc_dump(void);
+
 // Funzioni di supporto per i test
 int pseudo_malloc_is_initialized(void);
 size_t pseudo_malloc_arena_size(void);

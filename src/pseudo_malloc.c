@@ -393,6 +393,38 @@ void pseudo_free(void* ptr) {
     push_free_block(block);
 }
 
+void pseudo_malloc_dump(void) {
+    int i;
+    BuddyBlock* current;
+
+    if (!g_allocator.initialized) {
+        printf("Allocator not initialized\n");
+        return;
+    }
+
+    printf("\n===== BUDDY ALLOCATOR DUMP =====\n");
+
+    for (i = 0; i <= g_allocator.num_levels; i++) {
+        printf("Level %d (size %lu): ", i, (unsigned long) block_size_for_level(i));
+        current = g_allocator.free_lists[i];
+
+        if (current == NULL) {
+            printf("empty");
+        }
+
+        while (current != NULL) {
+            printf("[free] -> ");
+            current = current->next;
+        }
+
+        printf("NULL\n");
+    }
+
+    printf("================================\n\n");
+
+    
+}
+
 // Rilascia le risorse dell'allocatore
 void pseudo_malloc_destroy(void) {
     if (!g_allocator.initialized) {
