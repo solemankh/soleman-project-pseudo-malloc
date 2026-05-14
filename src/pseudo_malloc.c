@@ -1,251 +1,189 @@
 #include "pseudo_malloc.h"
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define MAX_LEVELS 16
+#define MAX_LEVELS 20
 
-// Metadato di un blocco buddy
-typedef struct BuddyBlock {
-    int level;                   // livello del blocco
-    int is_free;                 // 1 se libero, 0 se occupato
-    char* start;                 // inizio del blocco nell'arena
-    size_t size;                 // dimensione del blocco
-    struct BuddyBlock* next;     // prossimo blocco nella free list
-    struct BuddyBlock* buddy;    // buddy logico
-    struct BuddyBlock* parent;   // blocco padre
-    struct BuddyBlock* left;     // figlio sinistro
-    struct BuddyBlock* right;    // figlio destro
-} BuddyBlock;
+// Buddy allocator rappresentato solo tramite bitmap e indici del tree
+typedef struct BitmapBuddyAllocator {
+    int initialized;
+    int num_levels;
+    size_t arena_size;
+    size_t min_bucket_size;
 
-// Stato globale del buddy allocator
-typedef struct BuddyAllocator {
-    int initialized;                     // stato init
-    int num_levels;                      // profondita' del buddy
-    size_t arena_size;                   // dimensione totale arena
-    size_t min_bucket_size;              // blocco minimo
-    char* memory;                        // arena gestita
-    BuddyBlock* free_lists[MAX_LEVELS];  // una free list per livello
-    BuddyBlock* root;                    // blocco iniziale
-} BuddyAllocator;
+    char* memory;
 
-static BuddyAllocator g_allocator = {0};
+    int max_node_idx;
+    size_t bitmap_bytes;
 
-// Calcola la dimensione minima dei blocchi
-static size_t compute_min_bucket_size(size_t arena_size, int num_levels) {
-    return arena_size >> num_levels;
+    // split_bitmap[idx] = 1 se il nodo e' stato diviso
+    unsigned char* split_bitmap;
+
+    // used_bitmap[idx] = 1 se il nodo e' occupato
+    unsigned char* used_bitmap;
+} BitmapBuddyAllocator;
+
+static BitmapBuddyAllocator g_allocator = {0};
+
+// -----------------------------
+// Bit helpers
+// -----------------------------
+
+static int bit_get(unsigned char* bitmap, int idx) {
+    return (bitmap[idx / 8] >> (idx % 8)) & 1;
 }
 
-// Ritorna la dimensione di un blocco a un certo livello
+static void bit_set(unsigned char* bitmap, int idx) {
+    bitmap[idx / 8] |= (unsigned char)(1u << (idx % 8));
+}
+
+static void bit_clear(unsigned char* bitmap, int idx) {
+    bitmap[idx / 8] &= (unsigned char)~(1u << (idx % 8));
+}
+
+// -----------------------------
+// Indexed buddy tree helpers
+// -----------------------------
+
+static int first_idx(int level) {
+    return 1 << level;
+}
+
+static int level_idx(int idx) {
+    int level = 0;
+
+    while (idx > 1) {
+        idx = idx / 2;
+        level++;
+    }
+
+    return level;
+}
+
+static int parent_idx(int idx) {
+    return idx / 2;
+}
+
+static int buddy_idx(int idx) {
+    if (idx & 1) {
+        return idx - 1;
+    }
+
+    return idx + 1;
+}
+
+static int left_child_idx(int idx) {
+    return idx * 2;
+}
+
+static int right_child_idx(int idx) {
+    return idx * 2 + 1;
+}
+
 static size_t block_size_for_level(int level) {
     return g_allocator.arena_size >> level;
 }
 
-// Inserisce un blocco in testa alla free list del livello
-static void push_free_block(BuddyBlock* block) {
-    block->next = g_allocator.free_lists[block->level];
-    g_allocator.free_lists[block->level] = block;
-    block->is_free = 1;
+static char* node_start_address(int idx) {
+    int level = level_idx(idx);
+    int offset = idx - first_idx(level);
+    size_t block_size = block_size_for_level(level);
+
+    return g_allocator.memory + ((size_t)offset * block_size);
 }
 
-// Rimuove un blocco specifico dalla free list del suo livello
-static void remove_free_block(BuddyBlock* block) {
-    BuddyBlock* current;
-    BuddyBlock* previous;
-    int level;
-
-    if (block == NULL) {
-        return;
-    }
-
-    level = block->level;
-    current = g_allocator.free_lists[level];
-    previous = NULL;
-
-    while (current != NULL) {
-        if (current == block) {
-            if (previous == NULL) {
-                g_allocator.free_lists[level] = current->next;
-            } else {
-                previous->next = current->next;
-            }
-
-            current->next = NULL;
-            return;
-        }
-
-        previous = current;
-        current = current->next;
-    }
+static int is_node_free(int idx) {
+    return !bit_get(g_allocator.split_bitmap, idx) &&
+           !bit_get(g_allocator.used_bitmap, idx);
 }
 
-// Estrae il primo blocco libero da un livello
-static BuddyBlock* pop_free_block(int level) {
-    BuddyBlock* block = g_allocator.free_lists[level];
+// -----------------------------
+// Buddy logic
+// -----------------------------
 
-    if (block == NULL) {
-        return NULL;
-    }
-
-    g_allocator.free_lists[level] = block->next;
-    block->next = NULL;
-    return block;
-}
-
-// Cerca il livello piu' piccolo che puo' contenere la richiesta
 static int level_for_request(size_t request_size) {
     int level;
 
     for (level = g_allocator.num_levels; level >= 0; --level) {
         if (block_size_for_level(level) >= request_size) {
-            if (level == g_allocator.num_levels ||
-                block_size_for_level(level + 1) < request_size) {
-                return level;
-            }
+            return level;
         }
     }
 
     return -1;
 }
 
-// Divide un blocco in due buddy al livello successivo
-static BuddyBlock* split_block(BuddyBlock* parent) {
-    BuddyBlock* left;
-    BuddyBlock* right;
-    size_t child_size;
+// Cerca ricorsivamente un nodo libero al livello richiesto.
+// Se serve, divide nodi piu' grandi marcandoli come split.
+static int allocate_node(int idx, int current_level, int target_level) {
+    int left;
+    int right;
+    int result;
 
-    if (parent == NULL) {
-        return NULL;
+    if (idx > g_allocator.max_node_idx) {
+        return 0;
     }
 
-    if (parent->level >= g_allocator.num_levels) {
-        return NULL;
+    if (bit_get(g_allocator.used_bitmap, idx)) {
+        return 0;
     }
 
-    child_size = parent->size / 2;
-
-    left = (BuddyBlock*) malloc(sizeof(BuddyBlock));
-    right = (BuddyBlock*) malloc(sizeof(BuddyBlock));
-
-    if (left == NULL || right == NULL) {
-        free(left);
-        free(right);
-        return NULL;
-    }
-
-    left->level = parent->level + 1;
-    left->is_free = 1;
-    left->start = parent->start;
-    left->size = child_size;
-    left->next = NULL;
-    left->buddy = right;
-    left->parent = parent;
-    left->left = NULL;
-    left->right = NULL;
-
-    right->level = parent->level + 1;
-    right->is_free = 1;
-    right->start = parent->start + child_size;
-    right->size = child_size;
-    right->next = NULL;
-    right->buddy = left;
-    right->parent = parent;
-    right->left = NULL;
-    right->right = NULL;
-
-    parent->left = left;
-    parent->right = right;
-    parent->is_free = 0;
-
-    // Il buddy destro torna nella free list
-    push_free_block(right);
-
-    // Il buddy sinistro prosegue nella discesa
-    return left;
-}
-
-// Ottiene un blocco libero del livello richiesto, facendo split se serve
-static BuddyBlock* obtain_block_at_level(int target_level) {
-    int level;
-    BuddyBlock* block;
-
-    for (level = target_level; level >= 0; --level) {
-        if (g_allocator.free_lists[level] != NULL) {
-            block = pop_free_block(level);
-
-            while (block != NULL && block->level < target_level) {
-                block = split_block(block);
-            }
-
-            return block;
+    if (current_level == target_level) {
+        if (is_node_free(idx)) {
+            bit_set(g_allocator.used_bitmap, idx);
+            return idx;
         }
+
+        return 0;
     }
 
-    return NULL;
+    if (is_node_free(idx)) {
+        bit_set(g_allocator.split_bitmap, idx);
+    }
+
+    if (!bit_get(g_allocator.split_bitmap, idx)) {
+        return 0;
+    }
+
+    left = left_child_idx(idx);
+    right = right_child_idx(idx);
+
+    result = allocate_node(left, current_level + 1, target_level);
+    if (result != 0) {
+        return result;
+    }
+
+    return allocate_node(right, current_level + 1, target_level);
 }
 
-// Prova a fare merge ricorsivo verso il padre
-static BuddyBlock* try_merge(BuddyBlock* block) {
-    BuddyBlock* buddy;
-    BuddyBlock* parent;
+// Dopo una free, prova a risalire unendo buddy liberi.
+static void try_merge_up(int idx) {
+    int parent;
+    int buddy;
 
-    if (block == NULL) {
-        return NULL;
-    }
+    while (idx > 1) {
+        parent = parent_idx(idx);
+        buddy = buddy_idx(idx);
 
-    while (block->parent != NULL) {
-        buddy = block->buddy;
-        parent = block->parent;
-
-        if (buddy == NULL) {
+        if (!is_node_free(idx) || !is_node_free(buddy)) {
             break;
         }
 
-        if (!buddy->is_free) {
-            break;
-        }
-
-        if (buddy->left != NULL || buddy->right != NULL) {
-            break;
-        }
-
-        if (block->left != NULL || block->right != NULL) {
-            break;
-        }
-
-        remove_free_block(block);
-        remove_free_block(buddy);
-
-        free(parent->left);
-        free(parent->right);
-
-        parent->left = NULL;
-        parent->right = NULL;
-        parent->is_free = 1;
-        parent->next = NULL;
-
-        block = parent;
+        bit_clear(g_allocator.split_bitmap, parent);
+        idx = parent;
     }
-
-    return block;
 }
 
-// Libera ricorsivamente l'albero dei metadati
-static void destroy_block_tree(BuddyBlock* block) {
-    if (block == NULL) {
-        return;
-    }
+// -----------------------------
+// Public API
+// -----------------------------
 
-    destroy_block_tree(block->left);
-    destroy_block_tree(block->right);
-    free(block);
-}
-
-// Inizializza la struttura del buddy allocator usando mmap per l'arena
 int pseudo_malloc_init(size_t arena_size, int num_levels) {
-    int i;
-    BuddyBlock* root;
     long page_size;
     void* mapped_memory;
 
@@ -270,7 +208,7 @@ int pseudo_malloc_init(size_t arena_size, int num_levels) {
         return -1;
     }
 
-    if (arena_size % (size_t) page_size != 0) {
+    if (arena_size % (size_t)page_size != 0) {
         printf("Error: arena_size must be a multiple of page size\n");
         return -1;
     }
@@ -289,50 +227,40 @@ int pseudo_malloc_init(size_t arena_size, int num_levels) {
         return -1;
     }
 
-    root = (BuddyBlock*) malloc(sizeof(BuddyBlock));
-    if (root == NULL) {
+    g_allocator.max_node_idx = (1 << (num_levels + 1)) - 1;
+    g_allocator.bitmap_bytes = ((size_t)g_allocator.max_node_idx + 8u) / 8u;
+
+    g_allocator.split_bitmap = (unsigned char*)calloc(g_allocator.bitmap_bytes, 1);
+    g_allocator.used_bitmap = (unsigned char*)calloc(g_allocator.bitmap_bytes, 1);
+
+    if (g_allocator.split_bitmap == NULL || g_allocator.used_bitmap == NULL) {
+        free(g_allocator.split_bitmap);
+        free(g_allocator.used_bitmap);
         munmap(mapped_memory, arena_size);
-        printf("Error: root metadata allocation failed\n");
+        printf("Error: bitmap allocation failed\n");
         return -1;
     }
 
     g_allocator.initialized = 1;
     g_allocator.num_levels = num_levels;
     g_allocator.arena_size = arena_size;
-    g_allocator.min_bucket_size = compute_min_bucket_size(arena_size, num_levels);
-    g_allocator.memory = (char*) mapped_memory;
+    g_allocator.min_bucket_size = arena_size >> num_levels;
+    g_allocator.memory = (char*)mapped_memory;
 
-    for (i = 0; i < MAX_LEVELS; i++) {
-        g_allocator.free_lists[i] = NULL;
-    }
-
-    // Il blocco root rappresenta tutta l'arena
-    root->level = 0;
-    root->is_free = 1;
-    root->start = g_allocator.memory;
-    root->size = arena_size;
-    root->next = NULL;
-    root->buddy = NULL;
-    root->parent = NULL;
-    root->left = NULL;
-    root->right = NULL;
-
-    g_allocator.root = root;
-    g_allocator.free_lists[0] = root;
-
-    printf("pseudo_malloc_init: arena size = %lu\n", (unsigned long) g_allocator.arena_size);
-    printf("pseudo_malloc_init: num levels = %d\n", g_allocator.num_levels);
-    printf("pseudo_malloc_init: min bucket size = %lu\n", (unsigned long) g_allocator.min_bucket_size);
-    printf("pseudo_malloc_init: page size = %ld\n", page_size);
+    printf("pseudo_malloc_init: arena size = %lu\n", (unsigned long)arena_size);
+    printf("pseudo_malloc_init: num levels = %d\n", num_levels);
+    printf("pseudo_malloc_init: min bucket size = %lu\n",
+           (unsigned long)g_allocator.min_bucket_size);
+    printf("pseudo_malloc_init: bitmap nodes = %d\n", g_allocator.max_node_idx);
 
     return 0;
 }
 
-// Alloca memoria cercando il livello adatto nel buddy system
 void* pseudo_malloc(size_t size) {
-    BuddyBlock* block;
     size_t request_size;
     int target_level;
+    int node_idx;
+    char* start;
 
     if (size == 0) {
         return NULL;
@@ -342,8 +270,8 @@ void* pseudo_malloc(size_t size) {
         return NULL;
     }
 
-    // Salviamo il puntatore al metadato nei primi byte del blocco
-    request_size = size + sizeof(BuddyBlock*);
+    // Nel record di controllo salvo l'indice del nodo, non un puntatore.
+    request_size = size + sizeof(int);
 
     if (request_size > g_allocator.arena_size) {
         return NULL;
@@ -354,21 +282,21 @@ void* pseudo_malloc(size_t size) {
         return NULL;
     }
 
-    block = obtain_block_at_level(target_level);
-    if (block == NULL) {
+    node_idx = allocate_node(1, 0, target_level);
+    if (node_idx == 0) {
         return NULL;
     }
 
-    block->is_free = 0;
-    *((BuddyBlock**) block->start) = block;
+    start = node_start_address(node_idx);
 
-    // Restituiamo l'indirizzo dopo il metadato utente
-    return block->start + sizeof(BuddyBlock*);
+    *((int*)start) = node_idx;
+
+    return start + sizeof(int);
 }
 
-// Libera un blocco e prova a fare merge con il buddy
 void pseudo_free(void* ptr) {
-    BuddyBlock* block;
+    char* control_record;
+    int node_idx;
 
     if (ptr == NULL) {
         return;
@@ -378,69 +306,71 @@ void pseudo_free(void* ptr) {
         return;
     }
 
-    block = *((BuddyBlock**) ((char*) ptr - sizeof(BuddyBlock*)));
-    if (block == NULL) {
+    control_record = (char*)ptr - sizeof(int);
+    node_idx = *((int*)control_record);
+
+    if (node_idx <= 0 || node_idx > g_allocator.max_node_idx) {
         return;
     }
 
-    block->is_free = 1;
-    block->next = NULL;
+    if (!bit_get(g_allocator.used_bitmap, node_idx)) {
+        return;
+    }
 
-    push_free_block(block);
-    block = try_merge(block);
-
-    remove_free_block(block);
-    push_free_block(block);
+    bit_clear(g_allocator.used_bitmap, node_idx);
+    try_merge_up(node_idx);
 }
 
 void pseudo_malloc_dump(void) {
-    int i;
-    BuddyBlock* current;
+    int level;
+    int idx;
+    int first;
+    int last;
 
     if (!g_allocator.initialized) {
         printf("Allocator not initialized\n");
         return;
     }
 
-    printf("\n===== BUDDY ALLOCATOR DUMP =====\n");
+    printf("\n===== BITMAP BUDDY DUMP =====\n");
 
-    for (i = 0; i <= g_allocator.num_levels; i++) {
-        printf("Level %d (size %lu): ", i, (unsigned long) block_size_for_level(i));
-        current = g_allocator.free_lists[i];
+    for (level = 0; level <= g_allocator.num_levels; ++level) {
+        first = first_idx(level);
+        last = (1 << (level + 1)) - 1;
 
-        if (current == NULL) {
-            printf("empty");
+        printf("Level %d (size %lu): ",
+               level,
+               (unsigned long)block_size_for_level(level));
+
+        for (idx = first; idx <= last; ++idx) {
+            if (bit_get(g_allocator.used_bitmap, idx)) {
+                printf("U");
+            } else if (bit_get(g_allocator.split_bitmap, idx)) {
+                printf("S");
+            } else {
+                printf("F");
+            }
         }
 
-        while (current != NULL) {
-            printf("[free] -> ");
-            current = current->next;
-        }
-
-        printf("NULL\n");
+        printf("\n");
     }
 
-    printf("================================\n\n");
-
-    
+    printf("Legend: F=free, S=split, U=used\n");
+    printf("=============================\n\n");
 }
 
-// Rilascia le risorse dell'allocatore
 void pseudo_malloc_destroy(void) {
     if (!g_allocator.initialized) {
         printf("Warning: destroy called before init\n");
         return;
     }
 
-    destroy_block_tree(g_allocator.root);
     munmap(g_allocator.memory, g_allocator.arena_size);
 
-    g_allocator.root = NULL;
-    g_allocator.memory = NULL;
-    g_allocator.initialized = 0;
-    g_allocator.num_levels = 0;
-    g_allocator.arena_size = 0;
-    g_allocator.min_bucket_size = 0;
+    free(g_allocator.split_bitmap);
+    free(g_allocator.used_bitmap);
+
+    memset(&g_allocator, 0, sizeof(g_allocator));
 
     printf("pseudo_malloc_destroy called\n");
 }
